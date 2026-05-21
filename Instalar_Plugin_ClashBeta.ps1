@@ -91,15 +91,15 @@ class AiClashGroup
 
 static class ClashExtractor
 {
-    public static List<ClashData> Extract(ClashTest test, string paramName)
+    public static List<ClashData> Extract(ClashTest test, List<string> paramNames)
     {
         var results = new List<ClashData>();
         foreach (SavedItem item in test.Children)
-            if (item is ClashResult) results.Add(Build((ClashResult)item, paramName));
+            if (item is ClashResult) results.Add(Build((ClashResult)item, paramNames));
         return results;
     }
 
-    static ClashData Build(ClashResult clash, string paramName)
+    static ClashData Build(ClashResult clash, List<string> paramNames)
     {
         var cd = new ClashData();
         cd.Id               = clash.Guid.ToString();
@@ -107,12 +107,12 @@ static class ClashExtractor
         cd.Status           = clash.Status.ToString();
         cd.PenetrationDepth = clash.Distance;
         cd.Centroid         = new double[] { clash.Center.X, clash.Center.Y, clash.Center.Z };
-        cd.Element1         = BuildElement(clash.CompositeItem1, paramName);
-        cd.Element2         = BuildElement(clash.CompositeItem2, paramName);
+        cd.Element1         = BuildElement(clash.CompositeItem1, paramNames);
+        cd.Element2         = BuildElement(clash.CompositeItem2, paramNames);
         return cd;
     }
 
-    static ElementInfo BuildElement(ModelItem item, string paramName)
+    static ElementInfo BuildElement(ModelItem item, List<string> paramNames)
     {
         if (item == null) return new ElementInfo();
         var info = new ElementInfo();
@@ -124,8 +124,9 @@ static class ClashExtractor
                 string val;
                 try { val = prop.Value.ToDisplayString(); } catch { continue; }
                 if (string.IsNullOrEmpty(val)) continue;
-                if (prop.DisplayName.StartsWith(paramName, System.StringComparison.OrdinalIgnoreCase))
-                    info.Params[prop.DisplayName] = val;
+                foreach (string pn in paramNames)
+                    if (prop.DisplayName.StartsWith(pn, System.StringComparison.OrdinalIgnoreCase))
+                        { info.Params[pn] = val; break; }
             }
         return info;
     }
@@ -142,35 +143,40 @@ static class ClashExtractor
 
 static class ClashGrouper
 {
-    public static GroupingProposal GroupByParam(List<ClashData> clashes, string paramName, Action<string> progress)
+    public static GroupingProposal GroupByParams(List<ClashData> clashes, List<string> paramNames, Action<string> progress)
     {
         var proposal = new GroupingProposal();
-        var byValue  = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        var byKey    = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
 
         foreach (ClashData c in clashes)
         {
-            string val = "";
-            if (c.Element1.Params != null && c.Element1.Params.ContainsKey(paramName))
-                val = c.Element1.Params[paramName];
-            else if (c.Element2.Params != null && c.Element2.Params.ContainsKey(paramName))
-                val = c.Element2.Params[paramName];
-            if (string.IsNullOrEmpty(val)) val = "Sin clasificar";
-            if (!byValue.ContainsKey(val)) byValue[val] = new List<string>();
-            byValue[val].Add(c.Id);
+            var parts = new List<string>();
+            foreach (string pn in paramNames)
+            {
+                string val = "";
+                if (c.Element1.Params != null && c.Element1.Params.ContainsKey(pn))
+                    val = c.Element1.Params[pn];
+                else if (c.Element2.Params != null && c.Element2.Params.ContainsKey(pn))
+                    val = c.Element2.Params[pn];
+                parts.Add(string.IsNullOrEmpty(val) ? "Sin dato" : val);
+            }
+            string key = string.Join(" | ", parts.ToArray());
+            if (!byKey.ContainsKey(key)) byKey[key] = new List<string>();
+            byKey[key].Add(c.Id);
         }
 
-        foreach (var kv in byValue)
+        foreach (var kv in byKey)
         {
             var g = new AiClashGroup();
             g.GroupName  = kv.Key;
-            g.Discipline = paramName;
+            g.Discipline = string.Join(" | ", paramNames.ToArray());
             g.ClashIds   = kv.Value;
             proposal.Groups.Add(g);
         }
 
         if (progress != null)
             progress(string.Format("Agrupamiento por '{0}': {1} grupos para {2} clashes",
-                paramName, proposal.Groups.Count, clashes.Count));
+                string.Join(" + ", paramNames.ToArray()), proposal.Groups.Count, clashes.Count));
         return proposal;
     }
 }
@@ -308,8 +314,8 @@ class ClashGrouperDialog : Form
         Font            = new System.Drawing.Font("Segoe UI", 9f);
         int y = 14;
 
-        SLbl("Parametro de agrupacion", y); y += 24;
-        FLbl("Parametro:", y + 2);
+        SLbl("Parametros de agrupacion  (separa varios con  /)", y); y += 24;
+        FLbl("Parametros:", y + 2);
         var txtParam_ = new TextBox { Location = new System.Drawing.Point(108, y), Width = 300 };
         txtParam = txtParam_; Controls.Add(txtParam); y += 26;
 
@@ -317,7 +323,7 @@ class ClashGrouperDialog : Form
         {
             Location  = new System.Drawing.Point(108, y),
             Width     = 370,
-            Text      = "Ej: ADIF_00_Descripcion_Producto  |  Level  |  Zona",
+            Text      = "Ej: ADIF_00_Descripcion_Producto  /  Tipo  /  Level",
             ForeColor = System.Drawing.Color.FromArgb(130, 130, 130),
             Font      = new System.Drawing.Font("Segoe UI", 8f)
         }); y += 24;
@@ -391,8 +397,10 @@ class ClashGrouperDialog : Form
     void OnRun(object sender, EventArgs e)
     {
         if (_running) return;
-        string paramName = txtParam.Text.Trim();
-        if (string.IsNullOrEmpty(paramName)) { Log("Introduce el nombre del parametro."); return; }
+        var paramNames = new List<string>();
+        foreach (string p in txtParam.Text.Split('/'))
+        { string t = p.Trim(); if (!string.IsNullOrEmpty(t)) paramNames.Add(t); }
+        if (paramNames.Count == 0) { Log("Introduce al menos un nombre de parametro."); return; }
 
         DocumentClash clashDoc; ClashTest activeTest; List<ClashData> clashes;
         try
@@ -402,27 +410,28 @@ class ClashGrouperDialog : Form
             if (sel < 0 || sel >= _tests.Count) throw new InvalidOperationException("Selecciona un Clash Test en el desplegable.");
             activeTest = _tests[sel];
 
-            clashes = ClashExtractor.Extract(activeTest, paramName);
+            clashes = ClashExtractor.Extract(activeTest, paramNames);
             int withParams = 0;
             foreach (ClashData cd in clashes)
                 if ((cd.Element1.Params != null && cd.Element1.Params.Count > 0) ||
                     (cd.Element2.Params != null && cd.Element2.Params.Count > 0)) withParams++;
 
-            Log(string.Format("Test: '{0}' - {1} clashes | parametro '{2}' en {3}/{1} elementos.",
-                activeTest.DisplayName, clashes.Count, paramName, withParams));
+            string paramsLabel = string.Join(" | ", paramNames.ToArray());
+            Log(string.Format("Test: '{0}' - {1} clashes | parametros '{2}' en {3}/{1} elementos.",
+                activeTest.DisplayName, clashes.Count, paramsLabel, withParams));
 
             if (withParams == 0)
-                Log("AVISO: Ningun elemento tiene ese parametro. Verifica el nombre exacto en las Propiedades de Navisworks (clic derecho sobre un elemento).");
+                Log("AVISO: Ningun elemento tiene esos parametros. Verifica los nombres exactos en Propiedades de Navisworks (clic derecho sobre un elemento).");
         }
         catch (Exception ex) { Log("ERROR: " + ex.Message); return; }
 
         SetRunning(true);
-        var capDoc = _doc; var capClash = clashDoc; var capTest = activeTest;
+        var capDoc = _doc; var capClash = clashDoc; var capTest = activeTest; var capParams = paramNames;
         Task.Run(delegate
         {
             GroupingProposal proposal;
             Action<string> progress = msg => Invoke((Action)delegate { Log(msg); });
-            try { proposal = ClashGrouper.GroupByParam(clashes, paramName, progress); }
+            try { proposal = ClashGrouper.GroupByParams(clashes, capParams, progress); }
             catch (Exception ex) { Invoke((Action)delegate { Log("ERROR: " + ex.Message); SetRunning(false); }); return; }
             Invoke((Action)delegate
             {
@@ -609,7 +618,7 @@ Write-Host " Pasos:"
 Write-Host " 1. Cierra y vuelve a abrir Navisworks"
 Write-Host " 2. Abre el NWF federado con Clash Detective ejecutado"
 Write-Host " 3. Pestana [ClashAI Beta] -> boton [Agrupar clashes]"
-Write-Host " 4. Escribe el nombre exacto del parametro (ej: Level)"
+Write-Host " 4. Escribe uno o mas parametros separados por / (ej: Level / Zona)"
 Write-Host " 5. Crea grupos vacios en Clash Detective antes de agrupar"
 Write-Host ""
 Read-Host "Pulse Enter para salir"
