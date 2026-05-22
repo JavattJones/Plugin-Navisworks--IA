@@ -1,5 +1,5 @@
 # ============================================================
-# Instala plugin "Coordinacion BIM" en Navisworks
+# Instala plugin "ClashAI" en Navisworks
 # Incluye: ClashAI (Agrupar con IA con Ollama local)
 # Ejecutar UNA VEZ para instalar/actualizar el plugin
 # Compatible con Navisworks Manage 2020-2026
@@ -306,6 +306,61 @@ static class OllamaClient
         return responseText;
     }
 
+    // ── Claude API (api.anthropic.com/v1/messages) ────────────────────────────
+    static async Task<string> CallClaudeRawAsync(
+        string prompt, string model, string apiKey,
+        double temperature, System.Threading.CancellationToken ct)
+    {
+        var jss = new JavaScriptSerializer();
+        jss.MaxJsonLength = int.MaxValue;
+        var msg = new Dictionary<string, object>();
+        msg["role"] = "user"; msg["content"] = prompt;
+        var body = new Dictionary<string, object>();
+        body["model"]       = model;
+        body["max_tokens"]  = 4096;
+        body["temperature"] = temperature;
+        body["system"]      = "You are a BIM coordination expert. Always respond with valid JSON only, no markdown fences, no explanations outside the JSON.";
+        body["messages"]    = new object[] { msg };
+        string json     = jss.Serialize(body);
+        var request     = new HttpRequestMessage(HttpMethod.Post, "https://api.anthropic.com/v1/messages");
+        request.Headers.Add("x-api-key", apiKey);
+        request.Headers.Add("anthropic-version", "2023-06-01");
+        request.Content = new StringContent(json, Encoding.UTF8, "application/json");
+        var resp        = await Http.SendAsync(request, ct);
+        string raw      = await resp.Content.ReadAsStringAsync();
+        // Parsear respuesta Claude: { "content": [{ "type":"text", "text":"..." }] }
+        object parsed = jss.DeserializeObject(raw);
+        if (parsed is Dictionary<string, object>)
+        {
+            var d = (Dictionary<string, object>)parsed;
+            if (d.ContainsKey("error") && d["error"] is Dictionary<string, object>)
+            {
+                var err = (Dictionary<string, object>)d["error"];
+                string msg2 = err.ContainsKey("message") ? err["message"].ToString() : "Error desconocido";
+                throw new InvalidOperationException("Claude API: " + msg2);
+            }
+            if (d.ContainsKey("content") && d["content"] is object[])
+            {
+                var blocks = (object[])d["content"];
+                if (blocks.Length > 0 && blocks[0] is Dictionary<string, object>)
+                {
+                    var block = (Dictionary<string, object>)blocks[0];
+                    if (block.ContainsKey("text") && block["text"] != null)
+                    {
+                        string text = block["text"].ToString().Trim();
+                        if (text.StartsWith("```"))
+                        {
+                            int nl = text.IndexOf('\n'); int fence = text.LastIndexOf("```");
+                            if (nl >= 0 && fence > nl) text = text.Substring(nl + 1, fence - nl - 1).Trim();
+                        }
+                        return text;
+                    }
+                }
+            }
+        }
+        throw new InvalidOperationException("No se pudo parsear la respuesta de Claude API.");
+    }
+
     // Extrae un mapa string→string desde un objeto JSON deserializado (solo valores escalares)
     static Dictionary<string, string> ExtractStringMap(object parsed)
     {
@@ -321,7 +376,8 @@ static class OllamaClient
     // ── Fase 2b: Reflexión — el LLM critica y refina su propia propuesta ──────
     static async Task<Dictionary<string, string>> DefineTaxonomyAsync(
         List<ClashSignature> signatures, string model, string baseUrl,
-        string criteria, Action<string> progress, System.Threading.CancellationToken ct)
+        string criteria, string provider, string apiKey,
+        Action<string> progress, System.Threading.CancellationToken ct)
     {
         var jss = new JavaScriptSerializer();
         jss.MaxJsonLength = int.MaxValue;
@@ -358,7 +414,9 @@ static class OllamaClient
             "* Return ONLY valid JSON\n\n" +
             "OUTPUT FORMAT: {\"reasoning\":\"your analysis\",\"taxonomy\":{\"key1\":\"Nombre A\",\"key2\":\"Nombre B\"}}";
 
-        string raw1    = await CallOllamaRawAsync(prompt1, model, baseUrl, 0.1, ct);
+        string raw1    = provider == "claude"
+            ? await CallClaudeRawAsync(prompt1, model, apiKey, 0.1, ct)
+            : await CallOllamaRawAsync(prompt1, model, baseUrl, 0.1, ct);
         object parsed1 = jss.DeserializeObject(raw1);
 
         string reasoning = "";
@@ -391,7 +449,9 @@ static class OllamaClient
             "Return the corrected taxonomy. If already correct, return it unchanged.\n" +
             "Return ONLY valid JSON: {\"key1\":\"Nombre A\",\"key2\":\"Nombre B\"}";
 
-        string raw2    = await CallOllamaRawAsync(prompt2, model, baseUrl, 0.1, ct);
+        string raw2    = provider == "claude"
+            ? await CallClaudeRawAsync(prompt2, model, apiKey, 0.1, ct)
+            : await CallOllamaRawAsync(prompt2, model, baseUrl, 0.1, ct);
         object parsed2 = jss.DeserializeObject(raw2);
 
         Dictionary<string, string> taxonomy2;
@@ -466,6 +526,7 @@ static class OllamaClient
     public static GroupingProposal Propose(
         List<ClashData> clashes, string model, string baseUrl,
         string criteria, string specificParam,
+        string provider, string apiKey,
         Action<string> progress, Action<int> onChunk,
         System.Threading.CancellationToken ct)
     {
@@ -482,7 +543,7 @@ static class OllamaClient
 
         // Fase 2: CoT + reflexion iterativa (2 llamadas LLM)
         ct.ThrowIfCancellationRequested();
-        var taxonomy = DefineTaxonomyAsync(signatures, model, baseUrl, criteria, progress, ct).GetAwaiter().GetResult();
+        var taxonomy = DefineTaxonomyAsync(signatures, model, baseUrl, criteria, provider, apiKey, progress, ct).GetAwaiter().GetResult();
         if (onChunk != null) onChunk(2);
 
         // Fase 3: asignacion en C# puro — sin mas LLM
@@ -602,7 +663,11 @@ static class GroupingApplicator
 
 class ClashAIDialog : Form
 {
+    ComboBox    cmbProvider;
+    Label       lblUrl;
     TextBox     txtUrl;
+    Label       lblApiKey;
+    TextBox     txtApiKey;
     TextBox     txtCriteria;
     TextBox     txtParam;
     ComboBox    cmbModel;
@@ -638,9 +703,19 @@ class ClashAIDialog : Form
         int y = 14;
 
         SLbl("Configuracion IA", y); y += 24;
-        FLbl("URL Ollama:", y + 2);
+        FLbl("Motor IA:", y + 2);
+        cmbProvider = new ComboBox { Location = new System.Drawing.Point(108, y), Width = 300, DropDownStyle = ComboBoxStyle.DropDownList };
+        cmbProvider.Items.Add("Ollama (local)"); cmbProvider.Items.Add("Claude API");
+        cmbProvider.SelectedIndex = 0; cmbProvider.SelectedIndexChanged += OnProviderChange;
+        Controls.Add(cmbProvider); y += 28;
+
+        lblUrl = new Label { Text = "URL Ollama:", Location = new System.Drawing.Point(14, y + 2), Width = 90, TextAlign = System.Drawing.ContentAlignment.MiddleRight, ForeColor = System.Drawing.Color.FromArgb(80, 80, 80) };
         txtUrl = new TextBox { Location = new System.Drawing.Point(108, y), Width = 300, Text = "http://localhost:11434" };
-        Controls.Add(txtUrl); y += 28;
+        Controls.Add(lblUrl); Controls.Add(txtUrl);
+
+        lblApiKey = new Label { Text = "API Key:", Location = new System.Drawing.Point(14, y + 2), Width = 90, TextAlign = System.Drawing.ContentAlignment.MiddleRight, ForeColor = System.Drawing.Color.FromArgb(80, 80, 80), Visible = false };
+        txtApiKey = new TextBox { Location = new System.Drawing.Point(108, y), Width = 300, PasswordChar = '*', Visible = false };
+        Controls.Add(lblApiKey); Controls.Add(txtApiKey); y += 28;
 
         FLbl("Criterio:", y + 2);
         txtCriteria = new TextBox
@@ -736,6 +811,30 @@ class ClashAIDialog : Form
 
     static void SetSt(Label l, string t, System.Drawing.Color c) { l.Text = t; l.ForeColor = c; }
 
+    void OnProviderChange(object sender, EventArgs e)
+    {
+        bool isClaude = cmbProvider.SelectedIndex == 1;
+        lblUrl.Visible    = txtUrl.Visible    = !isClaude;
+        lblApiKey.Visible = txtApiKey.Visible = isClaude;
+        btnRefresh.Enabled = !isClaude;
+        cmbModel.Items.Clear();
+        if (isClaude)
+        {
+            cmbModel.Items.Add("claude-sonnet-4-6");
+            cmbModel.Items.Add("claude-haiku-4-5-20251001");
+            cmbModel.Items.Add("claude-opus-4-7");
+            cmbModel.SelectedIndex = 0;
+            string envKey = System.Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY") ?? "";
+            if (!string.IsNullOrEmpty(envKey) && string.IsNullOrEmpty(txtApiKey.Text))
+            { txtApiKey.Text = envKey; Log("API key cargada desde ANTHROPIC_API_KEY"); }
+        }
+        else
+        {
+            cmbModel.Items.Add("llama3.2");
+            cmbModel.SelectedIndex = 0;
+        }
+    }
+
     void OnRefresh(object sender, EventArgs e)
     {
         string url = txtUrl.Text.TrimEnd('/');
@@ -756,7 +855,10 @@ class ClashAIDialog : Form
     {
         if (_running) return;
         string model       = cmbModel.SelectedItem != null ? cmbModel.SelectedItem.ToString() : "llama3.2";
+        bool   isClaude    = cmbProvider.SelectedIndex == 1;
         string url         = txtUrl.Text.TrimEnd('/');
+        string apiKey      = txtApiKey.Text.Trim();
+        if (isClaude && string.IsNullOrEmpty(apiKey)) { Log("ERROR: introduce una API Key de Anthropic."); return; }
         string paramPrefix = txtParam.Text.Trim();
         List<ClashData> clashes; DocumentClash clashDoc; ClashTest activeTest;
         try
@@ -799,9 +901,10 @@ class ClashAIDialog : Form
             GroupingProposal proposal;
             Action<string> progress = msg => Invoke((Action)delegate { Log(msg); });
             Action<int> onChunk = n => Invoke((Action)delegate { if (pbProgress.Value < pbProgress.Maximum) pbProgress.Value = n; });
-            try { proposal = OllamaClient.Propose(clashes, model, url, criteria, specificParam, progress, onChunk, token); }
+            string prov = isClaude ? "claude" : "ollama";
+            try { proposal = OllamaClient.Propose(clashes, model, url, criteria, specificParam, prov, apiKey, progress, onChunk, token); }
             catch (System.OperationCanceledException) { Invoke((Action)delegate { Log("Operacion cancelada por el usuario."); SetRunning(false); }); return; }
-            catch (Exception ex) { Invoke((Action)delegate { Log("ERROR Ollama: " + ex.Message); SetRunning(false); }); return; }
+            catch (Exception ex) { Invoke((Action)delegate { Log("ERROR LLM: " + ex.Message); SetRunning(false); }); return; }
             Invoke((Action)delegate
             {
                 try
@@ -892,7 +995,7 @@ class ClashAIDialog : Form
 
 // ═══ VIEWPOINTCREATOR: PLUGIN PRINCIPAL ══════════════════════════════════════
 
-[Plugin("ViewpointCreator", "ACCIONA", DisplayName = "Coordinacion BIM")]
+[Plugin("ViewpointCreator", "ACCIONA", DisplayName = "ClashAI")]
 [RibbonLayout("Ribbon_ViewpointCreator.xaml")]
 [RibbonTab("ID_Tab_ViewpointCreator")]
 [Command("ID_RunClashAI",
@@ -936,7 +1039,7 @@ $xaml = @'
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     xmlns:local="clr-namespace:Autodesk.Navisworks.Gui.Roamer.AIRLook;assembly=navisworks.gui.roamer">
 
-    <RibbonTab Id="ID_Tab_ViewpointCreator" Title="Coordinacion BIM" KeyTip="CB">
+    <RibbonTab Id="ID_Tab_ViewpointCreator" Title="ClashAI" KeyTip="CA">
         <RibbonPanel x:Uid="RibbonPanel_ClashAI">
             <RibbonPanelSource x:Uid="RibbonPanelSource_ClashAI" Title="Analisis IA">
                 <local:NWRibbonButton x:Uid="Button_RunClashAI"
@@ -957,10 +1060,10 @@ $nameFile = @'
 $utf8
 
 DisplayName=
-Coordinacion BIM
+ClashAI
 
 ID_Tab_ViewpointCreator.DisplayName=
-Coordinacion BIM
+ClashAI
 
 ID_RunClashAI.DisplayName=
 Agrupar con IA
@@ -1058,7 +1161,7 @@ Write-Host ""
 Write-Host " Pasos:"
 Write-Host " 1. Cierra y vuelve a abrir Navisworks 2026"
 Write-Host " 2. Abre cualquier NWF federado"
-Write-Host " 3. Pestana [Coordinacion BIM] -> dos botones:"
+Write-Host " 3. Pestana [ClashAI] -> dos botones:"
 Write-Host "    - [Crear Viewpoints]  (desde XML)"
 Write-Host "    - [Agrupar con IA]    (Ollama en localhost:11434)"
 Write-Host ""
