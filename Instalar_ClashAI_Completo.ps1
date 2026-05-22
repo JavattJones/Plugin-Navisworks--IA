@@ -102,6 +102,16 @@ class AiClashGroup
     public List<string> ClashIds   { get; set; }
 }
 
+class ClashSignature
+{
+    public ClashSignature() { ClashIds = new List<string>(); }
+    public string       Key      { get; set; }
+    public string       Elem1    { get; set; }
+    public string       Elem2    { get; set; }
+    public int          Count    { get; set; }
+    public List<string> ClashIds { get; set; }
+}
+
 // ═══ CLAASHAI: EXTRACTOR ═════════════════════════════════════════════════════
 
 static class ClashExtractor
@@ -166,7 +176,6 @@ static class ClashExtractor
 
 static class OllamaClient
 {
-    internal const int MaxChunk = 20;
     static readonly HttpClient Http = new HttpClient { Timeout = TimeSpan.FromMinutes(30) };
 
     public static async Task<List<string>> ListModelsAsync(string baseUrl)
@@ -214,7 +223,7 @@ static class OllamaClient
         foreach (var kv in byValue)
         {
             var g = new AiClashGroup();
-            g.GroupName = kv.Key;
+            g.GroupName  = kv.Key;
             g.Discipline = paramName;
             g.ClashIds   = kv.Value;
             proposal.Groups.Add(g);
@@ -225,141 +234,265 @@ static class OllamaClient
         return proposal;
     }
 
-    public static GroupingProposal Propose(List<ClashData> clashes, string model, string baseUrl, string criteria, string specificParam, Action<string> progress, Action<int> onChunk, System.Threading.CancellationToken ct)
+    // ── Fase 1: extraer firmas únicas (par de tipos de elementos) ────────────
+    static List<ClashSignature> ExtractSignatures(List<ClashData> clashes)
     {
-        // Si hay un parámetro específico, agrupar directamente sin LLM
-        if (!string.IsNullOrEmpty(specificParam))
-            return GroupByParam(clashes, specificParam, progress);
-
-        var merged = new GroupingProposal();
-        int total = (int)Math.Ceiling((double)clashes.Count / MaxChunk);
-        for (int i = 0; i < clashes.Count; i += MaxChunk)
+        var map = new Dictionary<string, ClashSignature>(StringComparer.OrdinalIgnoreCase);
+        foreach (ClashData c in clashes)
         {
-            ct.ThrowIfCancellationRequested();
-            int chunk = i / MaxChunk + 1;
-            int take = Math.Min(MaxChunk, clashes.Count - i);
-            if (progress != null)
+            string d1  = ElemDescriptor(c.Element1);
+            string d2  = ElemDescriptor(c.Element2);
+            // Clave canónica: orden alfabético para que A-vs-B == B-vs-A
+            string key = string.Compare(d1, d2, StringComparison.OrdinalIgnoreCase) <= 0
+                ? d1 + " vs " + d2
+                : d2 + " vs " + d1;
+            ClashSignature sig;
+            if (!map.TryGetValue(key, out sig))
             {
-                int sinNivel = 0, sinCat = 0;
-                var bloque = clashes.GetRange(i, take);
-                foreach (ClashData c in bloque)
-                {
-                    if (string.IsNullOrEmpty(c.Element1.Level) && string.IsNullOrEmpty(c.Element2.Level)) sinNivel++;
-                    if (string.IsNullOrEmpty(c.Element1.Category) && string.IsNullOrEmpty(c.Element2.Category)) sinCat++;
-                }
-                progress(string.Format("Bloque {0}/{1}: {2} clashes | sin nivel: {3} | sin categoria: {4}", chunk, total, take, sinNivel, sinCat));
+                sig = new ClashSignature { Key = key, Elem1 = d1, Elem2 = d2 };
+                map[key] = sig;
             }
-            var part = CallAsync(clashes.GetRange(i, take), model, baseUrl, criteria, ct).GetAwaiter().GetResult();
-            merged.Groups.AddRange(part.Groups);
-            if (onChunk != null) onChunk(chunk);
-            if (progress != null)
-            {
-                progress(string.Format("  -> {0} grupos en bloque {1}", part.Groups.Count, chunk));
-                if (part.Groups.Count == 0 && progress != null)
-                    progress("     AVISO: 0 grupos. Los clashes de este bloque pueden tener propiedades IFC vacias.");
-            }
+            sig.Count++;
+            sig.ClashIds.Add(c.Id);
         }
-        return merged;
+        return new List<ClashSignature>(map.Values);
     }
 
-    static async Task<GroupingProposal> CallAsync(List<ClashData> clashes, string model, string baseUrl, string criteria, System.Threading.CancellationToken ct)
+    static string ElemDescriptor(ElementInfo e)
+    {
+        if (e == null) return "Desconocido";
+        // Parámetros personalizados tienen prioridad (ya filtrados por prefijo en Extract)
+        if (e.Params != null)
+            foreach (var kv in e.Params)
+                if (!string.IsNullOrEmpty(kv.Value)) return kv.Value;
+        var parts = new List<string>();
+        if (!string.IsNullOrEmpty(e.Category)) parts.Add(e.Category);
+        if (!string.IsNullOrEmpty(e.Level))    parts.Add(e.Level);
+        if (parts.Count == 0 && !string.IsNullOrEmpty(e.SourceFile)) parts.Add(e.SourceFile);
+        return parts.Count > 0 ? string.Join(" | ", parts.ToArray()) : "Desconocido";
+    }
+
+    // ── Llamada base a Ollama (reutilizable) ─────────────────────────────────
+    static async Task<string> CallOllamaRawAsync(
+        string prompt, string model, string baseUrl,
+        double temperature, System.Threading.CancellationToken ct)
     {
         var jss = new JavaScriptSerializer();
         jss.MaxJsonLength = int.MaxValue;
-
-        // IDs simples (c0, c1...) en lugar de GUIDs — el LLM los copia sin errores
-        var idMap = new Dictionary<string, string>();
-        var list = new List<Dictionary<string, object>>();
-        for (int i = 0; i < clashes.Count; i++)
-        {
-            string sid = "c" + i;
-            idMap[sid] = clashes[i].Id;
-            var d = ToDict(clashes[i]);
-            d["id"] = sid;
-            list.Add(d);
-        }
-        string clashJson = jss.Serialize(list);
-
-        string userCriteria = string.IsNullOrEmpty(criteria)
-            ? "Group by discipline pair (Structure-HVAC, Structure-Plumbing, MEP-MEP, etc.)"
-            : criteria;
-
-        string prompt =
-            "You are a BIM coordination expert. Group the following Navisworks clashes.\n\n" +
-            "GROUPING CRITERIA (follow this instruction from the user):\n" +
-            userCriteria + "\n\n" +
-            "CLASHES:\n" + clashJson + "\n\n" +
-            "RULES:\n" +
-            "* Every clash must appear in exactly one group\n" +
-            "* Use the exact id values (c0, c1, c2...) in the clashIds array\n" +
-            "* groupName must be descriptive, in Spanish\n" +
-            "* Return ONLY valid JSON\n\n" +
-            "OUTPUT FORMAT: {\"groups\":[{\"groupName\":\"G01 - Descripcion\",\"discipline\":\"A-B\",\"clashIds\":[\"c0\",\"c1\"]}]}";
-
         var body = new Dictionary<string, object>();
-        body["model"] = model; body["prompt"] = prompt; body["stream"] = false; body["format"] = "json";
-        var opts = new Dictionary<string, object>(); opts["temperature"] = 0.1; body["options"] = opts;
-
+        body["model"]  = model;
+        body["prompt"] = prompt;
+        body["stream"] = false;
+        body["format"] = "json";
+        var opts = new Dictionary<string, object>();
+        opts["temperature"] = temperature;
+        body["options"] = opts;
         string json = jss.Serialize(body);
         var content = new StringContent(json, Encoding.UTF8, "application/json");
-        var resp = await Http.PostAsync(baseUrl + "/api/generate", content, ct);
+        var resp    = await Http.PostAsync(baseUrl + "/api/generate", content, ct);
         resp.EnsureSuccessStatusCode();
-        string raw = await resp.Content.ReadAsStringAsync();
-
+        string raw  = await resp.Content.ReadAsStringAsync();
         var ollamaResp = jss.Deserialize<OllamaResponse>(raw);
         if (ollamaResp == null) throw new InvalidOperationException("Respuesta vacia de Ollama.");
         if (!string.IsNullOrEmpty(ollamaResp.Error)) throw new InvalidOperationException("Ollama: " + ollamaResp.Error);
-
         string responseText = (ollamaResp.Response ?? "").Trim();
-        // Limpiar fences markdown si el modelo los incluye
         if (responseText.StartsWith("```"))
         {
-            int nl = responseText.IndexOf('\n');
+            int nl    = responseText.IndexOf('\n');
             int fence = responseText.LastIndexOf("```");
             if (nl >= 0 && fence > nl)
                 responseText = responseText.Substring(nl + 1, fence - nl - 1).Trim();
         }
+        return responseText;
+    }
 
-        var proposal = jss.Deserialize<GroupingProposal>(responseText);
-        if (proposal == null) throw new InvalidOperationException("No se pudo parsear la propuesta.");
+    // Extrae un mapa string→string desde un objeto JSON deserializado (solo valores escalares)
+    static Dictionary<string, string> ExtractStringMap(object parsed)
+    {
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (!(parsed is Dictionary<string, object>)) return result;
+        foreach (var kv in (Dictionary<string, object>)parsed)
+            if (kv.Value != null && !(kv.Value is Dictionary<string, object>) && !(kv.Value is object[]))
+                result[kv.Key] = kv.Value.ToString();
+        return result;
+    }
 
-        // Remap IDs simples → GUIDs reales de Navisworks
-        foreach (AiClashGroup group in proposal.Groups)
-            for (int i = 0; i < group.ClashIds.Count; i++)
-            {
-                string sid = group.ClashIds[i];
-                string realId;
-                if (idMap.TryGetValue(sid, out realId))
-                    group.ClashIds[i] = realId;
-            }
+    // ── Fase 2a: Chain of Thought — razona y propone taxonomía inicial ────────
+    // ── Fase 2b: Reflexión — el LLM critica y refina su propia propuesta ──────
+    static async Task<Dictionary<string, string>> DefineTaxonomyAsync(
+        List<ClashSignature> signatures, string model, string baseUrl,
+        string criteria, Action<string> progress, System.Threading.CancellationToken ct)
+    {
+        var jss = new JavaScriptSerializer();
+        jss.MaxJsonLength = int.MaxValue;
 
+        var sigList = new List<Dictionary<string, object>>();
+        foreach (ClashSignature s in signatures)
+        {
+            var d = new Dictionary<string, object>();
+            d["key"]   = s.Key;
+            d["elem1"] = s.Elem1;
+            d["elem2"] = s.Elem2;
+            d["count"] = s.Count;
+            sigList.Add(d);
+        }
+        string sigJson = jss.Serialize(sigList);
+
+        string userCriteria = string.IsNullOrEmpty(criteria)
+            ? "Group by discipline pair and level (Structure-HVAC, Structure-Plumbing, MEP-MEP, etc.)"
+            : criteria;
+
+        // ── Pasada 1: Chain of Thought ────────────────────────────────────────
+        if (progress != null) progress("Fase 2a: LLM genera taxonomia (Chain of Thought)...");
+        string prompt1 =
+            "You are a BIM coordination expert. Define grouping rules for Navisworks clash results.\n\n" +
+            "GROUPING CRITERIA:\n" + userCriteria + "\n\n" +
+            "ELEMENT TYPE PAIRS:\n" + sigJson + "\n\n" +
+            "INSTRUCTIONS:\n" +
+            "Step 1: Briefly analyze what grouping dimensions make sense for these element types (2-3 sentences).\n" +
+            "Step 2: Define a group name for every key using those dimensions.\n" +
+            "RULES:\n" +
+            "* Every 'key' must appear in the taxonomy\n" +
+            "* groupNames must be in Spanish\n" +
+            "* You may assign multiple keys to the same groupName to consolidate\n" +
+            "* Return ONLY valid JSON\n\n" +
+            "OUTPUT FORMAT: {\"reasoning\":\"your analysis\",\"taxonomy\":{\"key1\":\"Nombre A\",\"key2\":\"Nombre B\"}}";
+
+        string raw1    = await CallOllamaRawAsync(prompt1, model, baseUrl, 0.1, ct);
+        object parsed1 = jss.DeserializeObject(raw1);
+
+        string reasoning = "";
+        Dictionary<string, string> taxonomy1;
+        if (parsed1 is Dictionary<string, object>)
+        {
+            var d1 = (Dictionary<string, object>)parsed1;
+            if (d1.ContainsKey("reasoning") && d1["reasoning"] != null)
+                reasoning = d1["reasoning"].ToString();
+            object taxObj = d1.ContainsKey("taxonomy") ? d1["taxonomy"] : parsed1;
+            taxonomy1 = ExtractStringMap(taxObj);
+        }
+        else { taxonomy1 = ExtractStringMap(parsed1); }
+
+        if (progress != null && !string.IsNullOrEmpty(reasoning))
+            progress("  Razonamiento: " + reasoning);
+        if (progress != null)
+            progress(string.Format("  -> {0} reglas en propuesta inicial", taxonomy1.Count));
+
+        // ── Pasada 2: Reflexión iterativa ─────────────────────────────────────
+        if (progress != null) progress("Fase 2b: LLM revisa y refina la propuesta...");
+        string prompt2 =
+            "You are a BIM coordination expert reviewing a grouping proposal.\n\n" +
+            "ORIGINAL ELEMENT PAIRS:\n" + sigJson + "\n\n" +
+            "YOUR PREVIOUS GROUPING PROPOSAL:\n" + jss.Serialize(taxonomy1) + "\n\n" +
+            "REVIEW CHECKLIST:\n" +
+            "* Are any groups semantically identical but named differently? Merge them into one canonical Spanish name.\n" +
+            "* Are there singleton groups (count=1 in original pairs) that logically belong to a larger group? Move them.\n" +
+            "* Does every 'key' from the original pairs appear in your output?\n\n" +
+            "Return the corrected taxonomy. If already correct, return it unchanged.\n" +
+            "Return ONLY valid JSON: {\"key1\":\"Nombre A\",\"key2\":\"Nombre B\"}";
+
+        string raw2    = await CallOllamaRawAsync(prompt2, model, baseUrl, 0.1, ct);
+        object parsed2 = jss.DeserializeObject(raw2);
+
+        Dictionary<string, string> taxonomy2;
+        if (parsed2 is Dictionary<string, object>)
+        {
+            var d2 = (Dictionary<string, object>)parsed2;
+            object taxObj2 = d2.ContainsKey("taxonomy") ? d2["taxonomy"] : parsed2;
+            taxonomy2 = ExtractStringMap(taxObj2);
+        }
+        else { taxonomy2 = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase); }
+
+        // Contar fusiones realizadas
+        var uniqueBefore = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string v in taxonomy1.Values) uniqueBefore.Add(v);
+        var uniqueAfter = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string v in taxonomy2.Values) uniqueAfter.Add(v);
+        int merged = uniqueBefore.Count - uniqueAfter.Count;
+
+        // Fallback: si la segunda pasada devuelve muy pocas reglas, usar la primera
+        if (taxonomy2.Count < taxonomy1.Count / 2)
+        {
+            if (progress != null) progress("  AVISO: revision incompleta. Usando propuesta inicial.");
+            return taxonomy1;
+        }
+
+        // Rellenar claves que la segunda pasada pudiera haber omitido
+        foreach (var kv in taxonomy1)
+            if (!taxonomy2.ContainsKey(kv.Key)) taxonomy2[kv.Key] = kv.Value;
+
+        if (progress != null)
+        {
+            string mergedInfo = merged > 0
+                ? string.Format("{0} grupos fusionados", merged)
+                : "sin fusiones";
+            progress(string.Format("  -> {0} reglas finales ({1})", taxonomy2.Count, mergedInfo));
+        }
+        return taxonomy2;
+    }
+
+    // ── Fase 3: asignación determinista clash → grupo (C#, sin LLM) ─────────
+    static GroupingProposal AssignByTaxonomy(
+        List<ClashData> clashes, List<ClashSignature> signatures,
+        Dictionary<string, string> taxonomy)
+    {
+        // Preconstruir mapa clashId → groupName a partir de las firmas
+        var clashToGroup = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (ClashSignature sig in signatures)
+        {
+            string groupName;
+            if (!taxonomy.TryGetValue(sig.Key, out groupName))
+                groupName = "Sin clasificar";
+            foreach (string id in sig.ClashIds)
+                clashToGroup[id] = groupName;
+        }
+
+        var byGroup = new Dictionary<string, AiClashGroup>(StringComparer.OrdinalIgnoreCase);
+        foreach (ClashData c in clashes)
+        {
+            string gn;
+            if (!clashToGroup.TryGetValue(c.Id, out gn)) gn = "Sin clasificar";
+            if (!byGroup.ContainsKey(gn))
+                byGroup[gn] = new AiClashGroup { GroupName = gn };
+            byGroup[gn].ClashIds.Add(c.Id);
+        }
+
+        var proposal = new GroupingProposal();
+        foreach (var kv in byGroup) proposal.Groups.Add(kv.Value);
         return proposal;
     }
 
-    static Dictionary<string, object> ToDict(ClashData c)
+    // ── Entrada principal ─────────────────────────────────────────────────────
+    public static GroupingProposal Propose(
+        List<ClashData> clashes, string model, string baseUrl,
+        string criteria, string specificParam,
+        Action<string> progress, Action<int> onChunk,
+        System.Threading.CancellationToken ct)
     {
-        var d = new Dictionary<string, object>();
-        d["id"]               = c.Id     != null ? c.Id     : "";
-        d["name"]             = c.Name   != null ? c.Name   : "";
-        d["status"]           = c.Status != null ? c.Status : "";
-        d["penetrationDepth"] = c.PenetrationDepth;
-        d["centroid"]         = c.Centroid;
-        d["element1"]         = ElemDict(c.Element1);
-        d["element2"]         = ElemDict(c.Element2);
-        return d;
-    }
+        if (!string.IsNullOrEmpty(specificParam))
+            return GroupByParam(clashes, specificParam, progress);
 
-    static Dictionary<string, object> ElemDict(ElementInfo e)
-    {
-        var d = new Dictionary<string, object>();
-        if (e == null) return d;
-        d["sourceFile"] = e.SourceFile != null ? e.SourceFile : "";
-        d["objectName"] = e.ObjectName != null ? e.ObjectName : "";
-        d["category"]   = e.Category   != null ? e.Category   : "";
-        d["level"]      = e.Level      != null ? e.Level      : "";
-        if (e.Params != null && e.Params.Count > 0)
-            d["params"] = e.Params;
-        return d;
+        // Fase 1: firmas únicas (C#, sin LLM, milisegundos)
+        if (progress != null)
+            progress(string.Format("Fase 1: extrayendo firmas de {0} clashes...", clashes.Count));
+        var signatures = ExtractSignatures(clashes);
+        if (progress != null)
+            progress(string.Format("  -> {0} combinaciones unicas de tipos de elementos", signatures.Count));
+        if (onChunk != null) onChunk(1);
+
+        // Fase 2: CoT + reflexion iterativa (2 llamadas LLM)
+        ct.ThrowIfCancellationRequested();
+        var taxonomy = DefineTaxonomyAsync(signatures, model, baseUrl, criteria, progress, ct).GetAwaiter().GetResult();
+        if (onChunk != null) onChunk(2);
+
+        // Fase 3: asignacion en C# puro — sin mas LLM
+        if (progress != null) progress("Fase 3: asignando clashes por firma...");
+        var proposal = AssignByTaxonomy(clashes, signatures, taxonomy);
+        if (progress != null)
+            progress(string.Format("  -> {0} grupos, {1} clashes asignados", proposal.Groups.Count, clashes.Count));
+        if (onChunk != null) onChunk(3);
+
+        return proposal;
     }
 }
 
@@ -655,10 +788,8 @@ class ClashAIDialog : Form
                 if (w.StartsWith(paramPrefix, StringComparison.OrdinalIgnoreCase) && w.Length > paramPrefix.Length)
                 { specificParam = w; break; }
         }
-        Log(string.Format("Enviando a {0}... (puede tardar 30-90 s)", model));
-        int totalChunks = string.IsNullOrEmpty(specificParam)
-            ? (int)Math.Ceiling((double)clashes.Count / OllamaClient.MaxChunk)
-            : 1;
+        Log(string.Format("Iniciando analisis con {0}...", model));
+        int totalChunks = string.IsNullOrEmpty(specificParam) ? 3 : 1;
         pbProgress.Maximum = totalChunks; pbProgress.Value = 0;
         _cts = new System.Threading.CancellationTokenSource();
         System.Threading.CancellationToken token = _cts.Token;
