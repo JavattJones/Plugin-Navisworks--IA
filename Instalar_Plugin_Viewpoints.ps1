@@ -166,7 +166,7 @@ static class ClashExtractor
 
 static class OllamaClient
 {
-    const int MaxChunk = 20;
+    internal const int MaxChunk = 20;
     static readonly HttpClient Http = new HttpClient { Timeout = TimeSpan.FromMinutes(30) };
 
     public static async Task<List<string>> ListModelsAsync(string baseUrl)
@@ -225,7 +225,7 @@ static class OllamaClient
         return proposal;
     }
 
-    public static GroupingProposal Propose(List<ClashData> clashes, string model, string baseUrl, string criteria, string specificParam, Action<string> progress)
+    public static GroupingProposal Propose(List<ClashData> clashes, string model, string baseUrl, string criteria, string specificParam, Action<string> progress, Action<int> onChunk, System.Threading.CancellationToken ct)
     {
         // Si hay un parámetro específico, agrupar directamente sin LLM
         if (!string.IsNullOrEmpty(specificParam))
@@ -235,6 +235,7 @@ static class OllamaClient
         int total = (int)Math.Ceiling((double)clashes.Count / MaxChunk);
         for (int i = 0; i < clashes.Count; i += MaxChunk)
         {
+            ct.ThrowIfCancellationRequested();
             int chunk = i / MaxChunk + 1;
             int take = Math.Min(MaxChunk, clashes.Count - i);
             if (progress != null)
@@ -248,8 +249,9 @@ static class OllamaClient
                 }
                 progress(string.Format("Bloque {0}/{1}: {2} clashes | sin nivel: {3} | sin categoria: {4}", chunk, total, take, sinNivel, sinCat));
             }
-            var part = CallAsync(clashes.GetRange(i, take), model, baseUrl, criteria).GetAwaiter().GetResult();
+            var part = CallAsync(clashes.GetRange(i, take), model, baseUrl, criteria, ct).GetAwaiter().GetResult();
             merged.Groups.AddRange(part.Groups);
+            if (onChunk != null) onChunk(chunk);
             if (progress != null)
             {
                 progress(string.Format("  -> {0} grupos en bloque {1}", part.Groups.Count, chunk));
@@ -260,7 +262,7 @@ static class OllamaClient
         return merged;
     }
 
-    static async Task<GroupingProposal> CallAsync(List<ClashData> clashes, string model, string baseUrl, string criteria)
+    static async Task<GroupingProposal> CallAsync(List<ClashData> clashes, string model, string baseUrl, string criteria, System.Threading.CancellationToken ct)
     {
         var jss = new JavaScriptSerializer();
         jss.MaxJsonLength = int.MaxValue;
@@ -300,7 +302,7 @@ static class OllamaClient
 
         string json = jss.Serialize(body);
         var content = new StringContent(json, Encoding.UTF8, "application/json");
-        var resp = await Http.PostAsync(baseUrl + "/api/generate", content);
+        var resp = await Http.PostAsync(baseUrl + "/api/generate", content, ct);
         resp.EnsureSuccessStatusCode();
         string raw = await resp.Content.ReadAsStringAsync();
 
@@ -473,14 +475,17 @@ class ClashAIDialog : Form
     ComboBox    cmbModel;
     Button      btnRefresh;
     Label       lblNwStatus;
-    Label       lblTestInfo;
+    ComboBox    cmbTest;
+    List<ClashTest> _tests = new List<ClashTest>();
     RichTextBox rtbLog;
     ProgressBar pbProgress;
     Button      btnRun;
+    Button      btnCancel;
     Button      btnClose;
 
     readonly Document _doc;
     bool _running;
+    System.Threading.CancellationTokenSource _cts;
 
     public ClashAIDialog(Document doc)
     {
@@ -532,9 +537,9 @@ class ClashAIDialog : Form
         lblNwStatus = new Label { Location = new System.Drawing.Point(108, y), Width = 300, Text = "Comprobando...", ForeColor = System.Drawing.Color.Gray, AutoSize = false };
         Controls.Add(lblNwStatus); y += 22;
 
-        FLbl("Test activo:", y + 2);
-        lblTestInfo = new Label { Location = new System.Drawing.Point(108, y), Width = 300, Text = "-", ForeColor = System.Drawing.Color.Gray, AutoSize = false };
-        Controls.Add(lblTestInfo); y += 32;
+        FLbl("Clash Test:", y + 2);
+        cmbTest = new ComboBox { Location = new System.Drawing.Point(108, y), Width = 300, DropDownStyle = ComboBoxStyle.DropDownList };
+        Controls.Add(cmbTest); y += 32;
 
         SLbl("Actividad", y); y += 24;
         rtbLog = new RichTextBox
@@ -545,19 +550,22 @@ class ClashAIDialog : Form
         };
         Controls.Add(rtbLog); y += 156;
 
-        pbProgress = new ProgressBar { Location = new System.Drawing.Point(14, y), Width = 472, Height = 5, Style = ProgressBarStyle.Marquee, MarqueeAnimationSpeed = 0 };
+        pbProgress = new ProgressBar { Location = new System.Drawing.Point(14, y), Width = 472, Height = 8, Style = ProgressBarStyle.Blocks, Minimum = 0, Maximum = 100, Value = 0 };
         Controls.Add(pbProgress); y += 22;
 
         btnRun = new Button
         {
-            Location = new System.Drawing.Point(14, y), Width = 170, Height = 32, Text = "Analizar clashes",
+            Location = new System.Drawing.Point(14, y), Width = 145, Height = 32, Text = "Analizar clashes",
             BackColor = System.Drawing.Color.FromArgb(0, 120, 215), ForeColor = System.Drawing.Color.White,
             FlatStyle = FlatStyle.Flat, Font = new System.Drawing.Font("Segoe UI", 9.5f, System.Drawing.FontStyle.Bold), Cursor = Cursors.Hand
         };
         btnRun.FlatAppearance.BorderSize = 0; btnRun.Click += OnRun; Controls.Add(btnRun);
 
-        var btnTest = new Button { Location = new System.Drawing.Point(192, y), Width = 130, Height = 32, Text = "Test agrupacion", FlatStyle = FlatStyle.Flat };
+        var btnTest = new Button { Location = new System.Drawing.Point(164, y), Width = 108, Height = 32, Text = "Test agrupacion", FlatStyle = FlatStyle.Flat };
         btnTest.Click += OnTestGroup; Controls.Add(btnTest);
+
+        btnCancel = new Button { Location = new System.Drawing.Point(276, y), Width = 110, Height = 32, Text = "Cancelar", FlatStyle = FlatStyle.Flat, Enabled = false };
+        btnCancel.Click += OnCancel; Controls.Add(btnCancel);
 
         btnClose = new Button { Location = new System.Drawing.Point(412, y), Width = 74, Height = 32, Text = "Cerrar" };
         btnClose.Click += delegate { Close(); }; Controls.Add(btnClose);
@@ -574,20 +582,23 @@ class ClashAIDialog : Form
         SetSt(lblNwStatus, "OK: " + file, System.Drawing.Color.Green);
         try
         {
+            _tests.Clear(); cmbTest.Items.Clear();
             var clashDoc = _doc.GetClash();
-            ClashTest test = null;
             if (clashDoc != null && clashDoc.TestsData != null && clashDoc.TestsData.Value != null && clashDoc.TestsData.Value.TestsRoot != null)
                 foreach (SavedItem si in clashDoc.TestsData.Value.TestsRoot.Children)
-                    if (si is ClashTest) { ClashTest ct = (ClashTest)si; if (ct.Children.Count > 0) { test = ct; break; } }
-
-            if (test != null)
-            {
-                int n = 0; foreach (SavedItem si in test.Children) if (si is ClashResult) n++;
-                SetSt(lblTestInfo, string.Format("'{0}' - {1} clashes", test.DisplayName, n), System.Drawing.Color.DarkGreen);
-            }
-            else { SetSt(lblTestInfo, "Sin test con resultados. Ejecute Clash Detective.", System.Drawing.Color.OrangeRed); btnRun.Enabled = false; }
+                {
+                    if (!(si is ClashTest)) continue;
+                    ClashTest ct = (ClashTest)si;
+                    int n = 0;
+                    foreach (SavedItem c in ct.Children) if (c is ClashResult) n++;
+                    if (n == 0) continue;
+                    _tests.Add(ct);
+                    cmbTest.Items.Add(string.Format("{0}  ({1} clashes)", ct.DisplayName, n));
+                }
+            if (_tests.Count > 0) { cmbTest.SelectedIndex = 0; }
+            else { cmbTest.Items.Add("Sin tests con resultados — ejecute Clash Detective"); cmbTest.SelectedIndex = 0; btnRun.Enabled = false; }
         }
-        catch (Exception ex) { SetSt(lblTestInfo, "Error: " + ex.Message, System.Drawing.Color.Crimson); btnRun.Enabled = false; }
+        catch (Exception ex) { cmbTest.Items.Clear(); cmbTest.Items.Add("Error: " + ex.Message); cmbTest.SelectedIndex = 0; btnRun.Enabled = false; }
     }
 
     static void SetSt(Label l, string t, System.Drawing.Color c) { l.Text = t; l.ForeColor = c; }
@@ -617,10 +628,10 @@ class ClashAIDialog : Form
         List<ClashData> clashes; DocumentClash clashDoc; ClashTest activeTest;
         try
         {
-            clashDoc = _doc.GetClash(); activeTest = null;
-            foreach (SavedItem si in clashDoc.TestsData.Value.TestsRoot.Children)
-                if (si is ClashTest) { ClashTest ct = (ClashTest)si; if (ct.Children.Count > 0) { activeTest = ct; break; } }
-            if (activeTest == null) throw new InvalidOperationException("No hay ningun test con resultados.");
+            clashDoc = _doc.GetClash();
+            int sel = cmbTest.SelectedIndex;
+            if (sel < 0 || sel >= _tests.Count) throw new InvalidOperationException("Selecciona un Clash Test en el desplegable.");
+            activeTest = _tests[sel];
             clashes = ClashExtractor.Extract(activeTest, paramPrefix);
             int withParams = 0;
             foreach (ClashData cd in clashes)
@@ -645,17 +656,26 @@ class ClashAIDialog : Form
                 { specificParam = w; break; }
         }
         Log(string.Format("Enviando a {0}... (puede tardar 30-90 s)", model));
+        int totalChunks = string.IsNullOrEmpty(specificParam)
+            ? (int)Math.Ceiling((double)clashes.Count / OllamaClient.MaxChunk)
+            : 1;
+        pbProgress.Maximum = totalChunks; pbProgress.Value = 0;
+        _cts = new System.Threading.CancellationTokenSource();
+        System.Threading.CancellationToken token = _cts.Token;
         var capDoc = _doc; var capClash = clashDoc; var capTest = activeTest;
         Task.Run(delegate
         {
             GroupingProposal proposal;
             Action<string> progress = msg => Invoke((Action)delegate { Log(msg); });
-            try { proposal = OllamaClient.Propose(clashes, model, url, criteria, specificParam, progress); }
+            Action<int> onChunk = n => Invoke((Action)delegate { if (pbProgress.Value < pbProgress.Maximum) pbProgress.Value = n; });
+            try { proposal = OllamaClient.Propose(clashes, model, url, criteria, specificParam, progress, onChunk, token); }
+            catch (System.OperationCanceledException) { Invoke((Action)delegate { Log("Operacion cancelada por el usuario."); SetRunning(false); }); return; }
             catch (Exception ex) { Invoke((Action)delegate { Log("ERROR Ollama: " + ex.Message); SetRunning(false); }); return; }
             Invoke((Action)delegate
             {
                 try
                 {
+                    pbProgress.Value = pbProgress.Maximum;
                     Log(string.Format("IA propone {0} grupos:", proposal.Groups.Count));
                     foreach (AiClashGroup g in proposal.Groups) Log(string.Format("  [{0}] - {1} clashes", g.GroupName, g.ClashIds.Count));
                     Log("Aplicando en Navisworks...");
@@ -729,7 +749,13 @@ class ClashAIDialog : Form
         catch (Exception ex) { Log("ERROR test: " + ex.Message); }
     }
 
-    void SetRunning(bool r) { _running = r; btnRun.Enabled = !r; btnClose.Enabled = !r; pbProgress.MarqueeAnimationSpeed = r ? 30 : 0; }
+    void SetRunning(bool r) { _running = r; btnRun.Enabled = !r; btnClose.Enabled = !r; btnCancel.Enabled = r; if (!r) { pbProgress.Value = 0; } }
+    void OnCancel(object s, EventArgs e)
+    {
+        if (_cts != null) _cts.Cancel();
+        btnCancel.Enabled = false;
+        Log("Cancelando...");
+    }
     void Log(string msg) { rtbLog.AppendText("[" + DateTime.Now.ToString("HH:mm:ss") + "] " + msg + "\n"); rtbLog.ScrollToCaret(); }
 }
 

@@ -63,11 +63,17 @@ Supports **Navisworks Manage 2020 through 2026**. Detected automatically.
 ### AI Mode (Ollama)
 1. Make sure [Ollama](https://ollama.com) is running locally
 2. Open the **[CoordinaciónBIM]** tab
-3. Choose your model (e.g. `llama3.2`) and Ollama URL
-4. Click **Analyze** — the plugin sends clashes in batches to your local LLM
-5. Review the proposed groups and apply
+3. Enter the Ollama URL and click **Buscar** to load available models
+4. Select your Clash Test from the dropdown
+5. Write your grouping criteria in plain language (or type a specific BIM parameter name)
+6. Optionally set a parameter prefix to extract (e.g. `ADIF_00`)
+7. Click **Analizar clashes** — the plugin sends clashes in batches to your local LLM
+8. Use **Cancelar** to stop mid-process if needed
+9. Review the log and apply
 
-> Clashes are sent in chunks of 20 with short IDs (`c0, c1...`) to keep the LLM context clean. Unclassified clashes land in a *Sin clasificar* group automatically.
+> Clashes are sent in chunks of 20 with short IDs (`c0, c1...`) to keep the LLM context clean. Progress is tracked per chunk. Unclassified clashes land in a *Sin clasificar* group automatically.
+>
+> If the criteria contains a specific parameter name that starts with the prefix, grouping runs deterministically in C# without calling the LLM — instant and reproducible.
 
 ---
 

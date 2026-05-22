@@ -1,0 +1,16 @@
+# Claude Code internal files
+.claude/
+AGENTS.md
+CHECKPOINTS.md
+CLAUDE.md
+feature_list.json
+init.ps1
+progress/
+
+# Empty files
+Manual_ClashAI_Beta.html
+docs/
+
+# Windows
+Thumbs.db
+desktop.ini
